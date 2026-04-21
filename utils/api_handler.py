@@ -1,930 +1,374 @@
 """
-API Handler for BotManager V2.5 - Enhanced AI Project Generator with Multi-Bot Support
-
-This module provides a centralized API handler for interacting with various AI services
-including OpenAI, Anthropic, and other LLM providers. It handles API key management,
-rate limiting, error handling, and response parsing.
+API Handler for BotManager V3.0 - DEEPSEEK V3.2 ONLY
+Single Provider, Ultra-Fast, No Fallbacks
+Zero Bloat, Maximum Performance
 """
 
 import os
 import json
-import time
 import logging
-from typing import Dict, List, Optional, Any, Union, Callable
-from dataclasses import dataclass, asdict
-from enum import Enum
+import time
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+
 import requests
-from requests.exceptions import RequestException, Timeout, ConnectionError
-import openai
-from openai import OpenAI, AsyncOpenAI
-import anthropic
-import backoff
+from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+load_dotenv()
+
 logger = logging.getLogger(__name__)
-
-
-class APIProvider(Enum):
-    """Enumeration of supported API providers"""
-    OPENAI = "openai"
-    ANTHROPIC = "anthropic"
-    GOOGLE = "google"
-    COHERE = "cohere"
-    HUGGINGFACE = "huggingface"
-    REPLICATE = "replicate"
-    TOGETHER = "together"
 
 
 @dataclass
 class APIResponse:
-    """Standardized API response structure"""
+    """Standardized API response"""
     success: bool
-    data: Optional[Any] = None
+    content: Optional[str] = None
     error: Optional[str] = None
-    provider: Optional[str] = None
-    model: Optional[str] = None
-    tokens_used: Optional[int] = None
-    latency: Optional[float] = None
-
-
-@dataclass
-class APIConfig:
-    """Configuration for API connections"""
-    provider: APIProvider
-    api_key: str
-    base_url: Optional[str] = None
-    timeout: int = 30
-    max_retries: int = 3
-    rate_limit_delay: float = 1.0
+    tokens: int = 0
+    latency: float = 0.0
+    provider: str = "deepseek"
+    model: str = "deepseek-chat"  # V3.2
 
 
 class APIHandler:
     """
-    Main API handler class for managing connections to various AI services.
-    
-    Features:
-    - Multi-provider support (OpenAI, Anthropic, Google, etc.)
-    - Automatic retry with exponential backoff
-    - Rate limiting and quota management
-    - Response standardization
-    - Error handling and logging
-    - Token usage tracking
+    DeepSeek V3.2 ONLY API Handler
+    - Model: deepseek-chat (V3.2)
+    - Single provider: DeepSeek
+    - No fallbacks
+    - Ultra-fast timeouts
+    - Connection pooling
+    - Smart retry logic
     """
     
-    def __init__(self, configs: Optional[Dict[APIProvider, APIConfig]] = None):
-        """
-        Initialize the API handler with configurations.
+    # Timeout constants
+    CONNECT_TIMEOUT = 8       # 8 seconds to connect
+    READ_TIMEOUT_MIN = 30     # Minimum 30s for reading
+    MAX_RETRIES = 3           # Maximum retry attempts
+    RETRY_DELAY = 1.5         # Delay between retries
+    
+    # Connection pool settings
+    POOL_CONNECTIONS = 20
+    POOL_MAXSIZE = 30
+    
+    def __init__(self):
+        """Initialize DeepSeek V3.2 API handler"""
+        self.api_key = os.getenv('DEEPSEEK_API_KEY')
+        if not self.api_key:
+            raise ValueError("❌ DEEPSEEK_API_KEY not found in environment variables")
         
-        Args:
-            configs: Dictionary mapping APIProvider to APIConfig objects
-        """
-        self.configs = configs or {}
-        self.clients = {}
-        self.rate_limiters = {}
-        self._initialize_from_secrets()
-        self._setup_clients()
+        # ⭐ DeepSeek V3.2 Configuration
+        self.api_url = "https://api.deepseek.com/v1/chat/completions"
+        self.model = "deepseek-chat"  # V3.2 Model
         
-        # Statistics tracking
+        # Alternative V3.2 model names if needed
+        self.model_aliases = ["deepseek-chat", "deepseek-v3", "deepseek-chat-v3"]
+        
+        # Create optimized session
+        self.session = self._create_session()
+        
+        # Statistics
         self.stats = {
             "total_requests": 0,
-            "successful_requests": 0,
-            "failed_requests": 0,
+            "successful": 0,
+            "failed": 0,
             "total_tokens": 0,
-            "provider_stats": {}
+            "total_latency": 0.0
         }
+        
+        logger.info("✅ DeepSeek V3.2 API Handler initialized (NO FALLBACKS)")
+        logger.info(f"   Model: {self.model} (V3.2)")
+        logger.info(f"   Timeouts: Connect={self.CONNECT_TIMEOUT}s, Read=Dynamic")
+        logger.info(f"   Max Tokens: 8192 (output)")
     
-    def _initialize_from_secrets(self):
-        """Initialize API configurations from environment variables/Replit Secrets"""
-        # OpenAI
-        openai_key = os.getenv("OPENAI_API_KEY")
-        if openai_key:
-            self.configs[APIProvider.OPENAI] = APIConfig(
-                provider=APIProvider.OPENAI,
-                api_key=openai_key,
-                base_url=os.getenv("OPENAI_BASE_URL"),
-                timeout=int(os.getenv("OPENAI_TIMEOUT", "30")),
-                max_retries=int(os.getenv("OPENAI_MAX_RETRIES", "3"))
-            )
+    def _create_session(self) -> requests.Session:
+        """Create optimized session with connection pooling"""
+        session = requests.Session()
         
-        # Anthropic
-        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-        if anthropic_key:
-            self.configs[APIProvider.ANTHROPIC] = APIConfig(
-                provider=APIProvider.ANTHROPIC,
-                api_key=anthropic_key,
-                timeout=int(os.getenv("ANTHROPIC_TIMEOUT", "30")),
-                max_retries=int(os.getenv("ANTHROPIC_MAX_RETRIES", "3"))
-            )
+        # Connection pool settings
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=self.POOL_CONNECTIONS,
+            pool_maxsize=self.POOL_MAXSIZE,
+            pool_block=False
+        )
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
         
-        # Google
-        google_key = os.getenv("GOOGLE_API_KEY")
-        if google_key:
-            self.configs[APIProvider.GOOGLE] = APIConfig(
-                provider=APIProvider.GOOGLE,
-                api_key=google_key,
-                base_url=os.getenv("GOOGLE_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"),
-                timeout=int(os.getenv("GOOGLE_TIMEOUT", "30")),
-                max_retries=int(os.getenv("GOOGLE_MAX_RETRIES", "3"))
-            )
+        # Keep-alive headers
+        session.headers.update({
+            'Connection': 'keep-alive',
+            'Accept-Encoding': 'gzip, deflate',
+            'Accept': 'application/json',
+        })
         
-        # Cohere
-        cohere_key = os.getenv("COHERE_API_KEY")
-        if cohere_key:
-            self.configs[APIProvider.COHERE] = APIConfig(
-                provider=APIProvider.COHERE,
-                api_key=cohere_key,
-                base_url=os.getenv("COHERE_BASE_URL", "https://api.cohere.ai/v1"),
-                timeout=int(os.getenv("COHERE_TIMEOUT", "30")),
-                max_retries=int(os.getenv("COHERE_MAX_RETRIES", "3"))
-            )
-        
-        # HuggingFace
-        hf_key = os.getenv("HUGGINGFACE_API_KEY")
-        if hf_key:
-            self.configs[APIProvider.HUGGINGFACE] = APIConfig(
-                provider=APIProvider.HUGGINGFACE,
-                api_key=hf_key,
-                base_url=os.getenv("HUGGINGFACE_BASE_URL", "https://api-inference.huggingface.co"),
-                timeout=int(os.getenv("HUGGINGFACE_TIMEOUT", "60")),
-                max_retries=int(os.getenv("HUGGINGFACE_MAX_RETRIES", "3"))
-            )
-        
-        # Replicate
-        replicate_key = os.getenv("REPLICATE_API_KEY")
-        if replicate_key:
-            self.configs[APIProvider.REPLICATE] = APIConfig(
-                provider=APIProvider.REPLICATE,
-                api_key=replicate_key,
-                timeout=int(os.getenv("REPLICATE_TIMEOUT", "60")),
-                max_retries=int(os.getenv("REPLICATE_MAX_RETRIES", "3"))
-            )
-        
-        # Together AI
-        together_key = os.getenv("TOGETHER_API_KEY")
-        if together_key:
-            self.configs[APIProvider.TOGETHER] = APIConfig(
-                provider=APIProvider.TOGETHER,
-                api_key=together_key,
-                base_url=os.getenv("TOGETHER_BASE_URL", "https://api.together.xyz/v1"),
-                timeout=int(os.getenv("TOGETHER_TIMEOUT", "30")),
-                max_retries=int(os.getenv("TOGETHER_MAX_RETRIES", "3"))
-            )
+        return session
     
-    def _setup_clients(self):
-        """Initialize client objects for each configured provider"""
-        for provider, config in self.configs.items():
-            try:
-                if provider == APIProvider.OPENAI:
-                    self.clients[provider] = OpenAI(
-                        api_key=config.api_key,
-                        base_url=config.base_url,
-                        timeout=config.timeout
-                    )
-                elif provider == APIProvider.ANTHROPIC:
-                    self.clients[provider] = anthropic.Anthropic(
-                        api_key=config.api_key,
-                        timeout=config.timeout
-                    )
-                # Other providers would be initialized here as needed
-                
-                logger.info(f"Initialized client for {provider.value}")
-                
-            except Exception as e:
-                logger.error(f"Failed to initialize client for {provider.value}: {e}")
-    
-    def _rate_limit(self, provider: APIProvider):
-        """Implement rate limiting for API calls"""
-        if provider not in self.rate_limiters:
-            self.rate_limiters[provider] = {"last_call": 0}
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        stream: bool = False,
+        top_p: float = 0.95
+    ) -> Dict[str, Any]:
+        """
+        Direct DeepSeek V3.2 chat - NO FALLBACKS
         
-        last_call = self.rate_limiters[provider]["last_call"]
-        current_time = time.time()
-        time_since_last_call = current_time - last_call
-        
-        config = self.configs.get(provider)
-        if config and time_since_last_call < config.rate_limit_delay:
-            sleep_time = config.rate_limit_delay - time_since_last_call
-            time.sleep(sleep_time)
-        
-        self.rate_limiters[provider]["last_call"] = time.time()
-    
-    @backoff.on_exception(
-        backoff.expo,
-        (RequestException, Timeout, ConnectionError),
-        max_tries=3
-    )
-    def _make_request_with_retry(self, func: Callable, *args, **kwargs) -> APIResponse:
-        """Make API request with exponential backoff retry logic"""
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+            temperature: Sampling temperature (0.0 to 2.0)
+            max_tokens: Maximum tokens to generate (up to 8192)
+            stream: Whether to stream response
+            top_p: Nucleus sampling parameter
+            
+        Returns:
+            Dict with success status and content/error
+        """
+        self.stats["total_requests"] += 1
         start_time = time.time()
         
-        try:
-            response = func(*args, **kwargs)
-            latency = time.time() - start_time
-            
-            return APIResponse(
-                success=True,
-                data=response,
-                latency=latency
-            )
-            
-        except Exception as e:
-            latency = time.time() - start_time
-            logger.error(f"API request failed: {e}")
-            
-            return APIResponse(
-                success=False,
-                error=str(e),
-                latency=latency
-            )
-    
-    def call_openai(
-        self,
-        model: str = "gpt-4",
-        messages: List[Dict[str, str]] = None,
-        temperature: float = 0.7,
-        max_tokens: Optional[int] = None,
-        **kwargs
-    ) -> APIResponse:
-        """
-        Call OpenAI API with the given parameters.
-        
-        Args:
-            model: The model to use (e.g., "gpt-4", "gpt-3.5-turbo")
-            messages: List of message dictionaries with "role" and "content"
-            temperature: Sampling temperature (0.0 to 2.0)
-            max_tokens: Maximum tokens to generate
-            **kwargs: Additional parameters for OpenAI API
-            
-        Returns:
-            APIResponse object with success status and data/error
-        """
-        self._rate_limit(APIProvider.OPENAI)
-        
-        if APIProvider.OPENAI not in self.clients:
-            return APIResponse(
-                success=False,
-                error="OpenAI client not configured",
-                provider="openai"
-            )
-        
-        try:
-            client = self.clients[APIProvider.OPENAI]
-            
-            # Prepare request parameters
-            params = {
-                "model": model,
-                "messages": messages or [],
-                "temperature": temperature,
-                **kwargs
+        # Validate API key
+        if not self.api_key:
+            return {
+                "success": False,
+                "error": "DeepSeek V3.2 API key not configured",
+                "provider": "deepseek",
+                "model": self.model
             }
-            
-            if max_tokens:
-                params["max_tokens"] = max_tokens
-            
-            # Make the API call
-            response = client.chat.completions.create(**params)
-            
-            # Extract content and token usage
-            content = response.choices[0].message.content
-            tokens_used = response.usage.total_tokens if response.usage else None
-            
-            # Update statistics
-            self._update_stats(APIProvider.OPENAI, True, tokens_used)
-            
-            return APIResponse(
-                success=True,
-                data=content,
-                provider="openai",
-                model=model,
-                tokens_used=tokens_used
-            )
-            
-        except Exception as e:
-            self._update_stats(APIProvider.OPENAI, False)
-            logger.error(f"OpenAI API call failed: {e}")
-            
-            return APIResponse(
-                success=False,
-                error=str(e),
-                provider="openai",
-                model=model
-            )
-    
-    def call_anthropic(
-        self,
-        model: str = "claude-3-opus-20240229",
-        messages: List[Dict[str, str]] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 1000,
-        **kwargs
-    ) -> APIResponse:
-        """
-        Call Anthropic Claude API with the given parameters.
         
-        Args:
-            model: The model to use (e.g., "claude-3-opus-20240229")
-            messages: List of message dictionaries with "role" and "content"
-            temperature: Sampling temperature (0.0 to 1.0)
-            max_tokens: Maximum tokens to generate
-            **kwargs: Additional parameters for Anthropic API
-            
-        Returns:
-            APIResponse object with success status and data/error
-        """
-        self._rate_limit(APIProvider.ANTHROPIC)
+        # Cap max_tokens at 8192 (V3.2 limit)
+        max_tokens = min(max_tokens, 8192)
         
-        if APIProvider.ANTHROPIC not in self.clients:
-            return APIResponse(
-                success=False,
-                error="Anthropic client not configured",
-                provider="anthropic"
-            )
+        # Prepare request
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Connection": "keep-alive"
+        }
         
-        try:
-            client = self.clients[APIProvider.ANTHROPIC]
-            
-            # Prepare messages for Anthropic format
-            system_message = None
-            anthropic_messages = []
-            
-            for msg in messages or []:
-                if msg["role"] == "system":
-                    system_message = msg["content"]
-                else:
-                    anthropic_messages.append({
-                        "role": msg["role"],
-                        "content": msg["content"]
-                    })
-            
-            # Make the API call
-            response = client.messages.create(
-                model=model,
-                messages=anthropic_messages,
-                system=system_message,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                **kwargs
-            )
-            
-            # Extract content
-            content = response.content[0].text
-            tokens_used = response.usage.input_tokens + response.usage.output_tokens
-            
-            # Update statistics
-            self._update_stats(APIProvider.ANTHROPIC, True, tokens_used)
-            
-            return APIResponse(
-                success=True,
-                data=content,
-                provider="anthropic",
-                model=model,
-                tokens_used=tokens_used
-            )
-            
-        except Exception as e:
-            self._update_stats(APIProvider.ANTHROPIC, False)
-            logger.error(f"Anthropic API call failed: {e}")
-            
-            return APIResponse(
-                success=False,
-                error=str(e),
-                provider="anthropic",
-                model=model
-            )
-    
-    def call_google(
-        self,
-        model: str = "gemini-pro",
-        prompt: str = "",
-        temperature: float = 0.7,
-        max_tokens: int = 1000,
-        **kwargs
-    ) -> APIResponse:
-        """
-        Call Google Gemini API with the given parameters.
+        payload = {
+            "model": self.model,  # deepseek-chat (V3.2)
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": stream,
+            "top_p": top_p
+        }
         
-        Args:
-            model: The model to use (e.g., "gemini-pro")
-            prompt: The input prompt
-            temperature: Sampling temperature (0.0 to 1.0)
-            max_tokens: Maximum tokens to generate
-            **kwargs: Additional parameters for Google API
+        # Calculate timeouts based on token count
+        if max_tokens > 4000:
+            read_timeout = 600  # 10 minutes for large generations
+        elif max_tokens > 2000:
+            read_timeout = 300  # 5 minutes for medium
+        else:
+            read_timeout = 120  # 2 minutes for small
             
-        Returns:
-            APIResponse object with success status and data/error
-        """
-        self._rate_limit(APIProvider.GOOGLE)
+        timeout_tuple = (self.CONNECT_TIMEOUT, read_timeout)
         
-        config = self.configs.get(APIProvider.GOOGLE)
-        if not config:
-            return APIResponse(
-                success=False,
-                error="Google API not configured",
-                provider="google"
-            )
+        # Retry logic
+        last_error = None
         
-        try:
-            # Prepare request
-            url = f"{config.base_url}/models/{model}:generateContent"
-            headers = {
-                "Content-Type": "application/json",
-                "x-goog-api-key": config.api_key
-            }
-            
-            payload = {
-                "contents": [{
-                    "parts": [{"text": prompt}]
-                }],
-                "generationConfig": {
-                    "temperature": temperature,
-                    "maxOutputTokens": max_tokens,
-                    **kwargs.get("generation_config", {})
-                }
-            }
-            
-            # Make the API call
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=config.timeout
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            # Extract content
-            if "candidates" in data and len(data["candidates"]) > 0:
-                content = data["candidates"][0]["content"]["parts"][0]["text"]
-            else:
-                content = ""
-            
-            # Update statistics
-            self._update_stats(APIProvider.GOOGLE, True)
-            
-            return APIResponse(
-                success=True,
-                data=content,
-                provider="google",
-                model=model
-            )
-            
-        except Exception as e:
-            self._update_stats(APIProvider.GOOGLE, False)
-            logger.error(f"Google API call failed: {e}")
-            
-            return APIResponse(
-                success=False,
-                error=str(e),
-                provider="google",
-                model=model
-            )
-    
-    def call_cohere(
-        self,
-        model: str = "command",
-        prompt: str = "",
-        temperature: float = 0.7,
-        max_tokens: int = 1000,
-        **kwargs
-    ) -> APIResponse:
-        """
-        Call Cohere API with the given parameters.
-        
-        Args:
-            model: The model to use (e.g., "command", "command-r")
-            prompt: The input prompt
-            temperature: Sampling temperature (0.0 to 1.0)
-            max_tokens: Maximum tokens to generate
-            **kwargs: Additional parameters for Cohere API
-            
-        Returns:
-            APIResponse object with success status and data/error
-        """
-        self._rate_limit(APIProvider.COHERE)
-        
-        config = self.configs.get(APIProvider.COHERE)
-        if not config:
-            return APIResponse(
-                success=False,
-                error="Cohere API not configured",
-                provider="cohere"
-            )
-        
-        try:
-            # Prepare request
-            url = f"{config.base_url}/generate"
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {config.api_key}"
-            }
-            
-            payload = {
-                "model": model,
-                "prompt": prompt,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                **kwargs
-            }
-            
-            # Make the API call
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=config.timeout
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            # Extract content
-            if "generations" in data and len(data["generations"]) > 0:
-                content = data["generations"][0]["text"]
-            else:
-                content = ""
-            
-            # Update statistics
-            self._update_stats(APIProvider.COHERE, True)
-            
-            return APIResponse(
-                success=True,
-                data=content,
-                provider="cohere",
-                model=model
-            )
-            
-        except Exception as e:
-            self._update_stats(APIProvider.COHERE, False)
-            logger.error(f"Cohere API call failed: {e}")
-            
-            return APIResponse(
-                success=False,
-                error=str(e),
-                provider="cohere",
-                model=model
-            )
-    
-    def call_huggingface(
-        self,
-        model: str = "gpt2",
-        inputs: str = "",
-        parameters: Optional[Dict] = None,
-        **kwargs
-    ) -> APIResponse:
-        """
-        Call HuggingFace Inference API with the given parameters.
-        
-        Args:
-            model: The model to use (e.g., "gpt2", "mistralai/Mistral-7B-Instruct-v0.1")
-            inputs: The input text
-            parameters: Generation parameters
-            **kwargs: Additional parameters
-            
-        Returns:
-            APIResponse object with success status and data/error
-        """
-        self._rate_limit(APIProvider.HUGGINGFACE)
-        
-        config = self.configs.get(APIProvider.HUGGINGFACE)
-        if not config:
-            return APIResponse(
-                success=False,
-                error="HuggingFace API not configured",
-                provider="huggingface"
-            )
-        
-        try:
-            # Prepare request
-            url = f"{config.base_url}/models/{model}"
-            headers = {
-                "Authorization": f"Bearer {config.api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "inputs": inputs,
-                "parameters": parameters or {},
-                **kwargs
-            }
-            
-            # Make the API call
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=config.timeout
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            # Update statistics
-            self._update_stats(APIProvider.HUGGINGFACE, True)
-            
-            return APIResponse(
-                success=True,
-                data=data,
-                provider="huggingface",
-                model=model
-            )
-            
-        except Exception as e:
-            self._update_stats(APIProvider.HUGGINGFACE, False)
-            logger.error(f"HuggingFace API call failed: {e}")
-            
-            return APIResponse(
-                success=False,
-                error=str(e),
-                provider="huggingface",
-                model=model
-            )
-    
-    def call_together(
-        self,
-        model: str = "mistralai/Mixtral-8x7B-Instruct-v0.1",
-        messages: List[Dict[str, str]] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 1000,
-        **kwargs
-    ) -> APIResponse:
-        """
-        Call Together AI API with the given parameters.
-        
-        Args:
-            model: The model to use
-            messages: List of message dictionaries
-            temperature: Sampling temperature
-            max_tokens: Maximum tokens to generate
-            **kwargs: Additional parameters
-            
-        Returns:
-            APIResponse object with success status and data/error
-        """
-        self._rate_limit(APIProvider.TOGETHER)
-        
-        config = self.configs.get(APIProvider.TOGETHER)
-        if not config:
-            return APIResponse(
-                success=False,
-                error="Together AI API not configured",
-                provider="together"
-            )
-        
-        try:
-            # Prepare request
-            url = f"{config.base_url}/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {config.api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "model": model,
-                "messages": messages or [],
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-                **kwargs
-            }
-            
-            # Make the API call
-            response = requests.post(
-                url,
-                headers=headers,
-                json=payload,
-                timeout=config.timeout
-            )
-            response.raise_for_status()
-            
-            data = response.json()
-            
-            # Extract content
-            if "choices" in data and len(data["choices"]) > 0:
-                content = data["choices"][0]["message"]["content"]
-                tokens_used = data.get("usage", {}).get("total_tokens")
-            else:
-                content = ""
-                tokens_used = None
-            
-            # Update statistics
-            self._update_stats(APIProvider.TOGETHER, True, tokens_used)
-            
-            return APIResponse(
-                success=True,
-                data=content,
-                provider="together",
-                model=model,
-                tokens_used=tokens_used
-            )
-            
-        except Exception as e:
-            self._update_stats(APIProvider.TOGETHER, False)
-            logger.error(f"Together AI API call failed: {e}")
-            
-            return APIResponse(
-                success=False,
-                error=str(e),
-                provider="together",
-                model=model
-            )
-    
-    def call_api(
-        self,
-        provider: Union[str, APIProvider],
-        **kwargs
-    ) -> APIResponse:
-        """
-        Generic API call method that routes to the appropriate provider.
-        
-        Args:
-            provider: The API provider (string or APIProvider enum)
-            **kwargs: Parameters specific to the provider
-            
-        Returns:
-            APIResponse object with success status and data/error
-        """
-        # Convert string to APIProvider enum if needed
-        if isinstance(provider, str):
+        for attempt in range(self.MAX_RETRIES):
             try:
-                provider = APIProvider(provider.lower())
-            except ValueError:
-                return APIResponse(
-                    success=False,
-                    error=f"Unknown provider: {provider}"
+                logger.debug(f"DeepSeek V3.2 request (attempt {attempt + 1}/{self.MAX_RETRIES}): {max_tokens} tokens")
+                
+                response = self.session.post(
+                    self.api_url,
+                    headers=headers,
+                    json=payload,
+                    timeout=timeout_tuple
                 )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    content = data["choices"][0]["message"]["content"]
+                    tokens = data.get("usage", {}).get("total_tokens", 0)
+                    latency = time.time() - start_time
+                    
+                    # Update stats
+                    self.stats["successful"] += 1
+                    self.stats["total_tokens"] += tokens
+                    self.stats["total_latency"] += latency
+                    
+                    logger.info(f"✅ DeepSeek V3.2 success: {tokens} tokens, {latency:.2f}s")
+                    
+                    return {
+                        "success": True,
+                        "content": content,
+                        "tokens": tokens,
+                        "latency": latency,
+                        "provider": "deepseek",
+                        "model": self.model,
+                        "version": "3.2"
+                    }
+                    
+                elif response.status_code == 429:
+                    # Rate limit - wait and retry
+                    wait_time = self.RETRY_DELAY * (attempt + 1)
+                    logger.warning(f"Rate limited (attempt {attempt + 1}), waiting {wait_time}s")
+                    time.sleep(wait_time)
+                    
+                elif response.status_code == 402:
+                    # Payment required
+                    self.stats["failed"] += 1
+                    return {
+                        "success": False,
+                        "error": "DeepSeek V3.2 credit/quota exceeded",
+                        "provider": "deepseek",
+                        "model": self.model
+                    }
+                    
+                else:
+                    error_msg = f"API Error {response.status_code}"
+                    try:
+                        error_data = response.json()
+                        error_msg = error_data.get('error', {}).get('message', error_msg)
+                    except:
+                        pass
+                    
+                    logger.error(f"DeepSeek V3.2 error: {error_msg}")
+                    last_error = error_msg
+                    
+            except requests.exceptions.Timeout:
+                logger.warning(f"Timeout (attempt {attempt + 1})")
+                last_error = "Request timeout"
+                
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"Connection error (attempt {attempt + 1}): {e}")
+                last_error = f"Connection error: {e}"
+                
+            except Exception as e:
+                logger.error(f"Unexpected error (attempt {attempt + 1}): {e}")
+                last_error = str(e)
+            
+            # Wait before retry
+            if attempt < self.MAX_RETRIES - 1:
+                time.sleep(self.RETRY_DELAY)
         
-        # Route to the appropriate method
-        if provider == APIProvider.OPENAI:
-            return self.call_openai(**kwargs)
-        elif provider == APIProvider.ANTHROPIC:
-            return self.call_anthropic(**kwargs)
-        elif provider == APIProvider.GOOGLE:
-            return self.call_google(**kwargs)
-        elif provider == APIProvider.COHERE:
-            return self.call_cohere(**kwargs)
-        elif provider == APIProvider.HUGGINGFACE:
-            return self.call_huggingface(**kwargs)
-        elif provider == APIProvider.TOGETHER:
-            return self.call_together(**kwargs)
-        else:
-            return APIResponse(
-                success=False,
-                error=f"Provider {provider.value} not implemented"
-            )
-    
-    def _update_stats(self, provider: APIProvider, success: bool, tokens_used: Optional[int] = None):
-        """Update statistics for API calls"""
-        self.stats["total_requests"] += 1
+        # All retries failed
+        self.stats["failed"] += 1
+        logger.error(f"❌ DeepSeek V3.2 failed after {self.MAX_RETRIES} attempts: {last_error}")
         
-        if success:
-            self.stats["successful_requests"] += 1
-        else:
-            self.stats["failed_requests"] += 1
-        
-        if tokens_used:
-            self.stats["total_tokens"] += tokens_used
-        
-        # Update provider-specific stats
-        provider_name = provider.value
-        if provider_name not in self.stats["provider_stats"]:
-            self.stats["provider_stats"][provider_name] = {
-                "requests": 0,
-                "successful": 0,
-                "failed": 0,
-                "tokens": 0
-            }
-        
-        provider_stats = self.stats["provider_stats"][provider_name]
-        provider_stats["requests"] += 1
-        
-        if success:
-            provider_stats["successful"] += 1
-        else:
-            provider_stats["failed"] += 1
-        
-        if tokens_used:
-            provider_stats["tokens"] += tokens_used
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get current API usage statistics"""
-        return self.stats.copy()
-    
-    def reset_stats(self):
-        """Reset all statistics"""
-        self.stats = {
-            "total_requests": 0,
-            "successful_requests": 0,
-            "failed_requests": 0,
-            "total_tokens": 0,
-            "provider_stats": {}
+        return {
+            "success": False,
+            "error": last_error or "Unknown error",
+            "latency": time.time() - start_time,
+            "provider": "deepseek",
+            "model": self.model
         }
     
-    def get_available_providers(self) -> List[str]:
-        """Get list of configured API providers"""
-        return [provider.value for provider in self.configs.keys()]
-    
-    def is_provider_available(self, provider: Union[str, APIProvider]) -> bool:
-        """Check if a provider is configured and available"""
-        if isinstance(provider, str):
-            try:
-                provider = APIProvider(provider.lower())
-            except ValueError:
-                return False
+    def generate_code(
+        self,
+        filename: str,
+        project_description: str,
+        max_tokens: int = 4096
+    ) -> Dict[str, Any]:
+        """
+        Generate code using DeepSeek V3.2
         
-        return provider in self.configs and provider in self.clients
-    
-    def add_config(self, config: APIConfig):
-        """Add or update an API configuration"""
-        self.configs[config.provider] = config
-        self._setup_clients()  # Reinitialize clients
-    
-    def remove_config(self, provider: APIProvider):
-        """Remove an API configuration"""
-        if provider in self.configs:
-            del self.configs[provider]
-        if provider in self.clients:
-            del self.clients[provider]
-    
-    def get_config(self, provider: APIProvider) -> Optional[APIConfig]:
-        """Get configuration for a specific provider"""
-        return self.configs.get(provider)
-    
-    def health_check(self) -> Dict[str, bool]:
-        """Check health/availability of all configured providers"""
-        health_status = {}
+        Args:
+            filename: Name of file to generate
+            project_description: Description of the project
+            max_tokens: Maximum tokens (up to 8192)
+            
+        Returns:
+            Dict with success status and code/error
+        """
+        system_prompt = f"""You are an expert programmer. Generate complete, production-ready code for {filename}.
         
-        for provider in self.configs.keys():
-            try:
-                # Simple test call or client check
-                if provider == APIProvider.OPENAI:
-                    # Test with a minimal request
-                    test_response = self.call_openai(
-                        model="gpt-3.5-turbo",
-                        messages=[{"role": "user", "content": "Hello"}],
-                        max_tokens=5
-                    )
-                    health_status[provider.value] = test_response.success
-                elif provider == APIProvider.ANTHROPIC:
-                    # Just check if client is initialized
-                    health_status[provider.value] = provider in self.clients
-                else:
-                    # For other providers, just check if configured
-                    health_status[provider.value] = True
-                    
-            except Exception as e:
-                logger.error(f"Health check failed for {provider.value}: {e}")
-                health_status[provider.value] = False
+        Project description: {project_description}
         
-        return health_status
+        Important:
+        - Provide ONLY the code without markdown formatting
+        - Include all necessary imports and dependencies
+        - Add helpful comments explaining key parts
+        - Ensure the code is functional and follows best practices"""
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Generate the complete code for {filename}"}
+        ]
+        
+        return self.chat(messages, temperature=0.3, max_tokens=max_tokens)
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get API usage statistics"""
+        avg_latency = 0
+        if self.stats["successful"] > 0:
+            avg_latency = self.stats["total_latency"] / self.stats["successful"]
+        
+        success_rate = 0
+        if self.stats["total_requests"] > 0:
+            success_rate = (self.stats["successful"] / self.stats["total_requests"]) * 100
+        
+        return {
+            "total_requests": self.stats["total_requests"],
+            "successful": self.stats["successful"],
+            "failed": self.stats["failed"],
+            "success_rate": f"{success_rate:.1f}%",
+            "total_tokens": self.stats["total_tokens"],
+            "avg_latency": f"{avg_latency:.2f}s",
+            "provider": "deepseek",
+            "model": self.model,
+            "version": "3.2",
+            "max_output_tokens": 8192,
+            "fallbacks": "NONE"
+        }
+    
+    def health_check(self) -> bool:
+        """Test DeepSeek V3.2 connection"""
+        test_messages = [{"role": "user", "content": "Hi"}]
+        response = self.chat(test_messages, max_tokens=10)
+        return response.get("success", False)
+    
+    def reset_stats(self):
+        """Reset statistics"""
+        self.stats = {
+            "total_requests": 0,
+            "successful": 0,
+            "failed": 0,
+            "total_tokens": 0,
+            "total_latency": 0.0
+        }
+        logger.info("Statistics reset")
 
 
-# Singleton instance for easy access
-_api_handler_instance = None
+# Singleton instance
+_api_handler = None
 
-def get_api_handler(configs: Optional[Dict[APIProvider, APIConfig]] = None) -> APIHandler:
-    """
-    Get or create the singleton API handler instance.
-    
-    Args:
-        configs: Optional configurations to initialize with
-        
-    Returns:
-        APIHandler instance
-    """
-    global _api_handler_instance
-    
-    if _api_handler_instance is None:
-        _api_handler_instance = APIHandler(configs)
-    
-    return _api_handler_instance
+def get_api_handler() -> APIHandler:
+    """Get or create singleton API handler"""
+    global _api_handler
+    if _api_handler is None:
+        _api_handler = APIHandler()
+    return _api_handler
 
 
 # Example usage
 if __name__ == "__main__":
-    # Example: Initialize and use the API handler
-    handler = get_api_handler()
+    handler = APIHandler()
     
-    # Check available providers
-    print("Available providers:", handler.get_available_providers())
+    print("=" * 50)
+    print("DeepSeek V3.2 API Test")
+    print(f"Model: {handler.model}")
+    print(f"Max Output Tokens: 8192")
+    print("=" * 50)
     
-    # Example OpenAI call
-    if handler.is_provider_available("openai"):
-        response = handler.call_openai(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": "Hello, how are you?"}
-            ],
-            temperature=0.7,
-            max_tokens=50
-        )
-        
-        if response.success:
-            print("OpenAI Response:", response.data)
-        else:
-            print("OpenAI Error:", response.error)
+    # Test chat
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "Hello, what model are you?"}
+    ]
     
-    # Get statistics
-    stats = handler.get_stats()
-    print("Statistics:", json.dumps(stats, indent=2))
+    response = handler.chat(messages, max_tokens=50)
+    
+    if response["success"]:
+        print(f"\n✅ Response: {response['content']}")
+        print(f"📊 Tokens: {response['tokens']}")
+        print(f"⏱️ Latency: {response['latency']:.2f}s")
+        print(f"🤖 Model: {response['model']}")
+    else:
+        print(f"\n❌ Error: {response['error']}")
+    
+    print(f"\n📈 Stats: {json.dumps(handler.get_stats(), indent=2)}")

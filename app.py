@@ -1,665 +1,483 @@
 #!/usr/bin/env python3
 """
-BotManager V2.5 - Enhanced AI Project Generator with Multi-Bot Support
-Main application file with enhanced features and multi-bot management
+BotManager V3.0 - DEEPSEEK ONLY
+Single Provider, Ultra-Fast, No Fallbacks
+Zero Bloat, Maximum Performance
 """
 
 import os
-import sys
 import json
+import uuid
 import logging
-import asyncio
-import threading
 import time
+import re
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple
-from pathlib import Path
+from typing import Dict, List, Optional, Any
 
-# Third-party imports
-from flask import Flask, render_template, request, jsonify, send_from_directory, Response
+from flask import Flask, render_template, request, jsonify, send_file
 from flask_cors import CORS
-import openai
-from openai import OpenAI, AsyncOpenAI
-import anthropic
-import replicate
-import cohere
-import google.generativeai as genai
-from huggingface_hub import InferenceClient
-import requests
 from dotenv import load_dotenv
 
-# Local imports
-from bot_manager import BotManager
-from project_generator import ProjectGenerator
-from config_manager import ConfigManager
-from utils.helpers import validate_api_key, format_timestamp, sanitize_filename
-from utils.logger import setup_logger
-from database.db_manager import DatabaseManager
+# Import handlers
+from utils.file_manager import FileManager
+from utils.github_handler import GitHubHandler
+from utils.api_handler import APIHandler
 
 # Load environment variables
 load_dotenv()
 
-# Initialize Flask app
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Initialize Flask
 app = Flask(__name__, 
             static_folder='static',
             template_folder='templates')
 CORS(app)
 
-# Setup logging
-logger = setup_logger(__name__)
+# Initialize handlers
+api_handler = APIHandler()  # DeepSeek ONLY
+file_manager = FileManager()
+github_handler = GitHubHandler(os.getenv('GITHUB_TOKEN'))
 
-# Global instances
-bot_manager = None
-project_generator = None
-config_manager = None
-db_manager = None
 
-# Configuration constants
-DEFAULT_CONFIG = {
-    "version": "2.5",
-    "max_bots": 10,
-    "default_model": "gpt-4-turbo-preview",
-    "project_storage": "./projects",
-    "log_level": "INFO",
-    "enable_analytics": True,
-    "auto_save_interval": 300,  # 5 minutes
-    "max_project_size_mb": 100,
-    "supported_models": {
-        "openai": ["gpt-4-turbo-preview", "gpt-4", "gpt-3.5-turbo"],
-        "anthropic": ["claude-3-opus-20240229", "claude-3-sonnet-20240229"],
-        "replicate": ["llama-2-70b-chat", "mistral-7b-instruct"],
-        "cohere": ["command", "command-light"],
-        "google": ["gemini-pro"],
-        "huggingface": ["mistralai/Mistral-7B-Instruct-v0.1"]
-    }
-}
-
-def initialize_services():
-    """Initialize all service components"""
-    global bot_manager, project_generator, config_manager, db_manager
+class ProjectPlanExtractor:
+    """Extract project plans from AI responses"""
     
-    try:
-        # Initialize configuration manager
-        config_manager = ConfigManager(DEFAULT_CONFIG)
+    VALID_EXTENSIONS = {
+        '.py', '.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.scss',
+        '.json', '.yaml', '.yml', '.toml', '.xml', '.md', '.txt',
+        '.sql', '.sh', '.env', '.gitignore', '.dockerignore'
+    }
+    
+    @classmethod
+    def extract_files(cls, response: str, user_message: str = "") -> List[str]:
+        """Extract file paths from AI response"""
+        files = []
         
-        # Initialize database
-        db_manager = DatabaseManager()
-        db_manager.initialize()
+        # Remove code blocks
+        response = re.sub(r'```[\s\S]*?```', '', response)
         
-        # Initialize bot manager
-        bot_manager = BotManager(config_manager, db_manager)
+        # Find file paths
+        path_pattern = re.compile(r'\b([a-zA-Z][\w\-/]*\.[a-zA-Z]{1,4})\b')
+        matches = path_pattern.findall(response)
         
-        # Initialize project generator
-        project_generator = ProjectGenerator(config_manager, db_manager, bot_manager)
+        seen = set()
+        for match in matches:
+            match = match.strip().strip('`*[](){}:;\'"')
+            ext = '.' + match.split('.')[-1].lower() if '.' in match else ''
+            if ext in cls.VALID_EXTENSIONS and match not in seen:
+                seen.add(match)
+                files.append(match)
         
-        logger.info("✅ All services initialized successfully")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize services: {str(e)}")
-        return False
+        # Smart defaults if no files found
+        if not files:
+            files = cls._get_default_files(user_message)
+        
+        logger.info(f"Extracted {len(files)} files")
+        return files[:35]  # Limit to 35 files
+    
+    @classmethod
+    def _get_default_files(cls, message: str) -> List[str]:
+        """Smart defaults based on project type"""
+        msg_lower = message.lower()
+        
+        if 'bot' in msg_lower or 'manager' in msg_lower:
+            return [
+                'app.py', 'config.py', 'requirements.txt',
+                'api/__init__.py', 'api/bots.py', 'api/chat.py',
+                'utils/api_handler.py', 'utils/file_manager.py',
+                'templates/index.html', 'static/css/style.css',
+                'static/js/app.js', 'README.md'
+            ]
+        elif 'flask' in msg_lower:
+            return [
+                'app.py', 'requirements.txt',
+                'templates/index.html', 'static/style.css',
+                'README.md'
+            ]
+        else:
+            return ['app.py', 'README.md']
 
-@app.before_request
-def before_request():
-    """Initialize services before first request if needed"""
-    global bot_manager
-    if bot_manager is None:
-        initialize_services()
+
+class CodeCleaner:
+    """Clean generated code"""
+    
+    @staticmethod
+    def clean(code: str) -> str:
+        if not code:
+            return ""
+        code = code.strip()
+        if code.startswith('```'):
+            lines = code.split('\n')
+            if lines and lines[0].startswith('```'):
+                lines = lines[1:]
+            if lines and lines[-1].startswith('```'):
+                lines = lines[:-1]
+            code = '\n'.join(lines)
+        return code.strip()
+
+
+def get_smart_tokens(filepath: str) -> int:
+    """Calculate optimal tokens based on file type"""
+    base_name = filepath.split('/')[-1].lower()
+    ext = filepath.split('.')[-1].lower() if '.' in filepath else ''
+    
+    # Ultra-small files
+    if base_name == '__init__.py':
+        return 150
+    elif filepath == 'requirements.txt':
+        return 250
+    elif filepath.endswith('.env') or filepath.endswith('.gitignore'):
+        return 200
+    elif base_name == 'README.md':
+        return 800
+    
+    # Config files
+    elif ext in ['txt', 'md', 'json', 'yaml', 'yml', 'toml']:
+        return 500
+    
+    # Frontend files
+    elif ext in ['css', 'scss', 'html']:
+        return 1500
+    
+    # Code files
+    elif ext in ['py', 'js', 'ts']:
+        if 'app.py' in base_name or 'main.py' in base_name:
+            return 4096
+        elif 'api' in filepath or 'handler' in filepath:
+            return 3000
+        else:
+            return 2500
+    
+    return 1000
+
+
+# ============================================================
+# ROUTES
+# ============================================================
 
 @app.route('/')
 def index():
-    """Serve the main dashboard"""
-    return render_template('index.html', 
-                         version=DEFAULT_CONFIG['version'],
-                         max_bots=DEFAULT_CONFIG['max_bots'])
+    """Serve main page"""
+    return render_template('index.html')
+
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    services_status = {
-        "bot_manager": bot_manager is not None,
-        "project_generator": project_generator is not None,
-        "config_manager": config_manager is not None,
-        "db_manager": db_manager is not None if db_manager else False,
-        "timestamp": format_timestamp(datetime.now())
-    }
-    
     return jsonify({
-        "status": "healthy",
-        "version": DEFAULT_CONFIG['version'],
-        "services": services_status
+        'status': 'healthy',
+        'timestamp': datetime.utcnow().isoformat(),
+        'version': '3.0.0',
+        'provider': 'deepseek',
+        'model': 'deepseek-chat',
+        'fallbacks': 'NONE',
+        'stats': api_handler.get_stats()
     })
 
-@app.route('/api/bots', methods=['GET'])
-def get_bots():
-    """Get all bots"""
-    try:
-        bots = bot_manager.get_all_bots()
-        return jsonify({
-            "success": True,
-            "bots": bots,
-            "count": len(bots)
-        })
-    except Exception as e:
-        logger.error(f"Error getting bots: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
 
-@app.route('/api/bots', methods=['POST'])
-def create_bot():
-    """Create a new bot"""
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    """Chat with DeepSeek - Get project plan"""
     try:
-        data = request.json
-        required_fields = ['name', 'model_type', 'model_name']
-        
-        # Validate required fields
-        for field in required_fields:
-            if field not in data:
-                return jsonify({
-                    "success": False,
-                    "error": f"Missing required field: {field}"
-                }), 400
-        
-        # Create bot
-        bot = bot_manager.create_bot(
-            name=data['name'],
-            model_type=data['model_type'],
-            model_name=data['model_name'],
-            description=data.get('description', ''),
-            config=data.get('config', {}),
-            api_key=data.get('api_key')
-        )
-        
-        return jsonify({
-            "success": True,
-            "bot": bot,
-            "message": f"Bot '{data['name']}' created successfully"
-        })
-    except Exception as e:
-        logger.error(f"Error creating bot: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'Invalid JSON payload'}), 400
 
-@app.route('/api/bots/<bot_id>', methods=['GET'])
-def get_bot(bot_id):
-    """Get a specific bot"""
-    try:
-        bot = bot_manager.get_bot(bot_id)
-        if bot:
-            return jsonify({"success": True, "bot": bot})
-        else:
-            return jsonify({"success": False, "error": "Bot not found"}), 404
-    except Exception as e:
-        logger.error(f"Error getting bot: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        user_message = data.get('message', '').strip()
+        project_id = data.get('project_id', str(uuid.uuid4()))
 
-@app.route('/api/bots/<bot_id>', methods=['PUT'])
-def update_bot(bot_id):
-    """Update a bot"""
-    try:
-        data = request.json
-        bot = bot_manager.update_bot(bot_id, data)
-        
-        if bot:
-            return jsonify({
-                "success": True,
-                "bot": bot,
-                "message": f"Bot updated successfully"
-            })
-        else:
-            return jsonify({"success": False, "error": "Bot not found"}), 404
-    except Exception as e:
-        logger.error(f"Error updating bot: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        if not user_message:
+            return jsonify({'error': 'Message cannot be empty'}), 400
 
-@app.route('/api/bots/<bot_id>', methods=['DELETE'])
-def delete_bot(bot_id):
-    """Delete a bot"""
-    try:
-        success = bot_manager.delete_bot(bot_id)
-        if success:
-            return jsonify({
-                "success": True,
-                "message": f"Bot deleted successfully"
-            })
-        else:
-            return jsonify({"success": False, "error": "Bot not found"}), 404
-    except Exception as e:
-        logger.error(f"Error deleting bot: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.info(f"Processing chat for project {project_id}")
 
-@app.route('/api/bots/<bot_id>/chat', methods=['POST'])
-def chat_with_bot(bot_id):
-    """Chat with a specific bot"""
-    try:
-        data = request.json
+        # System prompt for project planning
+        system_prompt = """You are an AI project planning assistant. When users describe a project:
+        1. Provide a structured plan with file structure
+        2. List specific files with full paths (e.g., backend/api/bots.py)
+        3. Recommend technical stack
+        4. Include key implementation details
+
+        Be specific about which files need to be created."""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+
+        # Get response from DeepSeek
+        response = api_handler.chat(messages)
         
-        if 'message' not in data:
-            return jsonify({
-                "success": False,
-                "error": "Missing message field"
-            }), 400
-        
-        # Get bot response
-        response = bot_manager.chat_with_bot(
-            bot_id=bot_id,
-            message=data['message'],
-            conversation_id=data.get('conversation_id'),
-            stream=data.get('stream', False)
-        )
+        if not response['success']:
+            return jsonify({'error': response['error']}), 500
+
+        ai_response = response['content']
+        files = ProjectPlanExtractor.extract_files(ai_response, user_message)
+
+        project_plan = {
+            'files': files,
+            'description': user_message[:200]
+        }
+
+        # Save project
+        project_data = {
+            'id': project_id,
+            'plan': project_plan,
+            'description': user_message,
+            'created_at': datetime.now().isoformat(),
+            'status': 'planned'
+        }
+        file_manager.write_json(f"projects/{project_id}.json", project_data)
+
+        logger.info(f"Files to generate: {files}")
         
         return jsonify({
-            "success": True,
-            "response": response,
-            "bot_id": bot_id,
-            "timestamp": format_timestamp(datetime.now())
+            'response': ai_response,
+            'project_id': project_id,
+            'project_plan': project_plan,
+            'tokens_used': response.get('tokens', 0)
         })
-    except Exception as e:
-        logger.error(f"Error chatting with bot: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
 
-@app.route('/api/bots/<bot_id>/test', methods=['POST'])
-def test_bot(bot_id):
-    """Test a bot's connectivity and functionality"""
-    try:
-        result = bot_manager.test_bot(bot_id)
-        return jsonify({
-            "success": True,
-            "test_result": result
-        })
     except Exception as e:
-        logger.error(f"Error testing bot: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.error(f"Chat error: {str(e)}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/api/generate', methods=['POST'])
+def generate_code():
+    """Generate code for all files in project"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'Invalid JSON payload'}), 400
+
+        project_id = data.get('project_id')
+        plan = data.get('plan', {})
+
+        if not project_id:
+            return jsonify({'error': 'Missing project_id'}), 400
+
+        files = plan.get('files', [])
+        if not files:
+            return jsonify({'error': 'No files specified in plan'}), 400
+
+        logger.info(f"🚀 Generating {len(files)} files for project {project_id}")
+
+        generated_files = {}
+        failed_files = []
+
+        for filepath in files:
+            try:
+                smart_tokens = get_smart_tokens(filepath)
+                logger.info(f"⚡ Generating {filepath} (tokens={smart_tokens})")
+
+                system_prompt = f"""You are an expert programmer. Generate complete, production-ready code for {filepath}.
+                
+                Important:
+                - Provide ONLY the code without markdown formatting
+                - Include all necessary imports and dependencies
+                - Add helpful comments
+                - Ensure the code is functional"""
+
+                messages = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Generate the complete code for {filepath}"}
+                ]
+
+                response = api_handler.chat(messages, max_tokens=smart_tokens)
+                
+                if response['success']:
+                    code = CodeCleaner.clean(response['content'])
+                    generated_files[filepath] = code
+                    file_manager.write_file(f"projects/{project_id}/files/{filepath}", code)
+                    logger.info(f"✅ Generated {filepath}")
+                else:
+                    failed_files.append(filepath)
+                    logger.error(f"❌ Failed {filepath}: {response['error']}")
+
+            except Exception as e:
+                logger.error(f"Failed {filepath}: {str(e)}")
+                failed_files.append(filepath)
+
+        if not generated_files:
+            raise Exception("No files were successfully generated")
+
+        # Push to GitHub if token available
+        repo_url = None
+        if os.getenv('GITHUB_TOKEN'):
+            try:
+                repo_name = f"ai-project-{project_id[:8]}"
+                repo_url = github_handler.create_and_push(repo_name, generated_files)
+                logger.info(f"📦 Pushed to GitHub: {repo_url}")
+            except Exception as e:
+                logger.warning(f"GitHub push failed: {e}")
+
+        # Update project status
+        project_file = f"projects/{project_id}.json"
+        if file_manager.file_exists(project_file):
+            project_data = file_manager.read_json(project_file)
+            project_data['status'] = 'generated'
+            project_data['repo_url'] = repo_url
+            project_data['generated_at'] = datetime.now().isoformat()
+            file_manager.write_json(project_file, project_data)
+
+        return jsonify({
+            'success': True,
+            'repo_url': repo_url,
+            'generated_files': list(generated_files.keys()),
+            'failed_files': failed_files if failed_files else None,
+            'stats': api_handler.get_stats()
+        })
+
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/api/projects', methods=['GET'])
 def get_projects():
     """Get all projects"""
     try:
-        projects = project_generator.get_all_projects()
-        return jsonify({
-            "success": True,
-            "projects": projects,
-            "count": len(projects)
-        })
+        projects = []
+        if file_manager.directory_exists('projects'):
+            for file in file_manager.list_files('projects', '*.json'):
+                project = file_manager.read_json(file)
+                projects.append({
+                    'id': project.get('id'),
+                    'description': project.get('description', '')[:100],
+                    'status': project.get('status', 'unknown'),
+                    'created_at': project.get('created_at'),
+                    'repo_url': project.get('repo_url')
+                })
+        
+        projects.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        return jsonify({'projects': projects})
+        
     except Exception as e:
-        logger.error(f"Error getting projects: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.error(f"Error getting projects: {e}")
+        return jsonify({'projects': [], 'error': str(e)})
 
-@app.route('/api/projects', methods=['POST'])
-def create_project():
-    """Create a new project"""
+
+@app.route('/api/project/<project_id>', methods=['GET'])
+def get_project(project_id: str):
+    """Get specific project"""
     try:
-        data = request.json
-        required_fields = ['name', 'description', 'bot_ids']
+        project_file = f"projects/{project_id}.json"
+        if not file_manager.file_exists(project_file):
+            return jsonify({'error': 'Project not found'}), 404
         
-        # Validate required fields
-        for field in required_fields:
-            if field not in data:
-                return jsonify({
-                    "success": False,
-                    "error": f"Missing required field: {field}"
-                }), 400
+        project = file_manager.read_json(project_file)
+        return jsonify({'project': project})
         
-        # Create project
-        project = project_generator.create_project(
-            name=data['name'],
-            description=data['description'],
-            bot_ids=data['bot_ids'],
-            requirements=data.get('requirements', ''),
-            tech_stack=data.get('tech_stack', []),
-            config=data.get('config', {})
-        )
-        
-        return jsonify({
-            "success": True,
-            "project": project,
-            "message": f"Project '{data['name']}' created successfully"
-        })
     except Exception as e:
-        logger.error(f"Error creating project: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.error(f"Error getting project: {e}")
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/projects/<project_id>', methods=['GET'])
-def get_project(project_id):
-    """Get a specific project"""
-    try:
-        project = project_generator.get_project(project_id)
-        if project:
-            return jsonify({"success": True, "project": project})
-        else:
-            return jsonify({"success": False, "error": "Project not found"}), 404
-    except Exception as e:
-        logger.error(f"Error getting project: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
 
-@app.route('/api/projects/<project_id>/generate', methods=['POST'])
-def generate_project(project_id):
-    """Generate project files"""
-    try:
-        data = request.json
-        
-        # Start generation process
-        result = project_generator.generate_project_files(
-            project_id=project_id,
-            generation_config=data.get('config', {})
-        )
-        
-        return jsonify({
-            "success": True,
-            "result": result,
-            "message": "Project generation started"
-        })
-    except Exception as e:
-        logger.error(f"Error generating project: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/projects/<project_id>/files', methods=['GET'])
-def get_project_files(project_id):
+@app.route('/api/project/<project_id>/files', methods=['GET'])
+def get_project_files(project_id: str):
     """Get all files for a project"""
     try:
-        files = project_generator.get_project_files(project_id)
-        return jsonify({
-            "success": True,
-            "files": files,
-            "count": len(files)
-        })
-    except Exception as e:
-        logger.error(f"Error getting project files: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/projects/<project_id>/download', methods=['GET'])
-def download_project(project_id):
-    """Download project as zip file"""
-    try:
-        zip_path = project_generator.export_project(project_id)
+        files_dir = f"projects/{project_id}/files"
+        if not file_manager.directory_exists(files_dir):
+            return jsonify({'files': []})
         
-        if zip_path and os.path.exists(zip_path):
-            return send_from_directory(
-                directory=os.path.dirname(zip_path),
-                path=os.path.basename(zip_path),
-                as_attachment=True,
-                download_name=f"project_{project_id}.zip"
-            )
-        else:
-            return jsonify({"success": False, "error": "Project not found or not generated"}), 404
-    except Exception as e:
-        logger.error(f"Error downloading project: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/config', methods=['GET'])
-def get_config():
-    """Get current configuration"""
-    try:
-        config = config_manager.get_config()
-        return jsonify({
-            "success": True,
-            "config": config
-        })
-    except Exception as e:
-        logger.error(f"Error getting config: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/config', methods=['PUT'])
-def update_config():
-    """Update configuration"""
-    try:
-        data = request.json
-        config_manager.update_config(data)
-        
-        return jsonify({
-            "success": True,
-            "message": "Configuration updated successfully",
-            "config": config_manager.get_config()
-        })
-    except Exception as e:
-        logger.error(f"Error updating config: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/models', methods=['GET'])
-def get_available_models():
-    """Get all available AI models"""
-    try:
-        models = config_manager.get_supported_models()
-        return jsonify({
-            "success": True,
-            "models": models
-        })
-    except Exception as e:
-        logger.error(f"Error getting models: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/analytics', methods=['GET'])
-def get_analytics():
-    """Get analytics data"""
-    try:
-        analytics = {
-            "total_bots": bot_manager.get_bot_count(),
-            "total_projects": project_generator.get_project_count(),
-            "active_bots": bot_manager.get_active_bot_count(),
-            "generated_files": project_generator.get_total_file_count(),
-            "api_usage": db_manager.get_api_usage_stats() if db_manager else {},
-            "performance_metrics": {
-                "avg_response_time": bot_manager.get_average_response_time(),
-                "success_rate": bot_manager.get_success_rate()
-            }
-        }
-        
-        return jsonify({
-            "success": True,
-            "analytics": analytics
-        })
-    except Exception as e:
-        logger.error(f"Error getting analytics: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/backup', methods=['POST'])
-def create_backup():
-    """Create a backup of all data"""
-    try:
-        backup_path = config_manager.create_backup()
-        
-        return jsonify({
-            "success": True,
-            "backup_path": backup_path,
-            "message": "Backup created successfully"
-        })
-    except Exception as e:
-        logger.error(f"Error creating backup: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route('/api/restore', methods=['POST'])
-def restore_backup():
-    """Restore from backup"""
-    try:
-        data = request.json
-        
-        if 'backup_path' not in data:
-            return jsonify({
-                "success": False,
-                "error": "Missing backup_path field"
-            }), 400
-        
-        success = config_manager.restore_backup(data['backup_path'])
-        
-        if success:
-            # Reinitialize services after restore
-            initialize_services()
-            
-            return jsonify({
-                "success": True,
-                "message": "Backup restored successfully"
+        files = []
+        for filepath in file_manager.list_files(files_dir, '*', recursive=True):
+            content = file_manager.read_file(filepath)
+            files.append({
+                'path': filepath.replace(f"projects/{project_id}/files/", ""),
+                'content': content
             })
-        else:
-            return jsonify({
-                "success": False,
-                "error": "Failed to restore backup"
-            }), 500
+        
+        return jsonify({'files': files})
+        
     except Exception as e:
-        logger.error(f"Error restoring backup: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.error(f"Error getting files: {e}")
+        return jsonify({'files': [], 'error': str(e)})
 
-@app.route('/api/validate-api-key', methods=['POST'])
-def validate_api_key_endpoint():
-    """Validate an API key for a specific service"""
+
+@app.route('/api/project/<project_id>/download', methods=['GET'])
+def download_project(project_id: str):
+    """Download project as ZIP"""
     try:
-        data = request.json
-        required_fields = ['service', 'api_key']
+        import zipfile
+        import io
         
-        for field in required_fields:
-            if field not in data:
-                return jsonify({
-                    "success": False,
-                    "error": f"Missing required field: {field}"
-                }), 400
+        files_dir = f"projects/{project_id}/files"
+        if not file_manager.directory_exists(files_dir):
+            return jsonify({'error': 'Project files not found'}), 404
         
-        is_valid = validate_api_key(data['service'], data['api_key'])
+        memory_file = io.BytesIO()
+        with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for filepath in file_manager.list_files(files_dir, '*', recursive=True):
+                arcname = filepath.replace(f"projects/{project_id}/files/", "")
+                zf.write(filepath, arcname)
         
-        return jsonify({
-            "success": True,
-            "is_valid": is_valid,
-            "service": data['service']
-        })
+        memory_file.seek(0)
+        return send_file(
+            memory_file,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f'project_{project_id}.zip'
+        )
+        
     except Exception as e:
-        logger.error(f"Error validating API key: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.error(f"Download error: {e}")
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/logs', methods=['GET'])
-def get_logs():
-    """Get application logs"""
+
+@app.route('/api/project/<project_id>', methods=['DELETE'])
+def delete_project(project_id: str):
+    """Delete a project"""
     try:
-        log_level = request.args.get('level', 'INFO')
-        limit = int(request.args.get('limit', 100))
+        project_file = f"projects/{project_id}.json"
+        files_dir = f"projects/{project_id}"
         
-        logs = config_manager.get_logs(log_level, limit)
+        if file_manager.file_exists(project_file):
+            file_manager.delete_file(project_file)
         
-        return jsonify({
-            "success": True,
-            "logs": logs,
-            "count": len(logs)
-        })
+        if file_manager.directory_exists(files_dir):
+            file_manager.delete_directory(files_dir, force=True)
+        
+        logger.info(f"Deleted project {project_id}")
+        return jsonify({'success': True, 'message': 'Project deleted'})
+        
     except Exception as e:
-        logger.error(f"Error getting logs: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        logger.error(f"Delete error: {e}")
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/api/status', methods=['GET'])
-def get_system_status():
-    """Get comprehensive system status"""
-    try:
-        status = {
-            "system": {
-                "version": DEFAULT_CONFIG['version'],
-                "uptime": time.time() - app_start_time,
-                "timestamp": format_timestamp(datetime.now()),
-                "python_version": sys.version,
-                "platform": sys.platform
-            },
-            "resources": {
-                "cpu_usage": os.cpu_count(),
-                "memory_usage": get_memory_usage(),
-                "disk_usage": get_disk_usage(),
-                "active_threads": threading.active_count()
-            },
-            "services": {
-                "bot_manager": "running" if bot_manager else "stopped",
-                "project_generator": "running" if project_generator else "stopped",
-                "database": "connected" if db_manager and db_manager.is_connected() else "disconnected"
-            },
-            "limits": {
-                "max_bots": DEFAULT_CONFIG['max_bots'],
-                "current_bots": bot_manager.get_bot_count() if bot_manager else 0,
-                "max_project_size": f"{DEFAULT_CONFIG['max_project_size_mb']}MB"
-            }
-        }
-        
-        return jsonify({
-            "success": True,
-            "status": status
-        })
-    except Exception as e:
-        logger.error(f"Error getting system status: {str(e)}")
-        return jsonify({"success": False, "error": str(e)}), 500
 
-def get_memory_usage():
-    """Get memory usage in MB"""
-    try:
-        import psutil
-        process = psutil.Process(os.getpid())
-        return process.memory_info().rss / 1024 / 1024  # Convert to MB
-    except:
-        return 0
-
-def get_disk_usage():
-    """Get disk usage information"""
-    try:
-        import psutil
-        usage = psutil.disk_usage('.')
-        return {
-            "total_gb": usage.total / 1024 / 1024 / 1024,
-            "used_gb": usage.used / 1024 / 1024 / 1024,
-            "free_gb": usage.free / 1024 / 1024 / 1024,
-            "percent": usage.percent
-        }
-    except:
-        return {"total_gb": 0, "used_gb": 0, "free_gb": 0, "percent": 0}
-
-@app.errorhandler(404)
-def not_found(error):
-    """Handle 404 errors"""
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """Get system statistics"""
     return jsonify({
-        "success": False,
-        "error": "Endpoint not found"
-    }), 404
+        'api': api_handler.get_stats(),
+        'provider': 'deepseek',
+        'model': 'deepseek-chat',
+        'fallbacks': 'NONE'
+    })
 
-@app.errorhandler(500)
-def internal_error(error):
-    """Handle 500 errors"""
-    logger.error(f"Internal server error: {str(error)}")
-    return jsonify({
-        "success": False,
-        "error": "Internal server error"
-    }), 500
-
-def start_background_tasks():
-    """Start background maintenance tasks"""
-    def maintenance_loop():
-        while True:
-            try:
-                # Clean up old temporary files
-                config_manager.cleanup_temp_files()
-                
-                # Update analytics
-                if db_manager:
-                    db_manager.update_analytics()
-                
-                # Check for updates
-                config_manager.check_for_updates()
-                
-            except Exception as e:
-                logger.error(f"Error in maintenance loop: {str(e)}")
-            
-            # Sleep for 1 hour
-            time.sleep(3600)
-    
-    # Start maintenance thread
-    maintenance_thread = threading.Thread(target=maintenance_loop, daemon=True)
-    maintenance_thread.start()
-    logger.info("✅ Background maintenance tasks started")
 
 if __name__ == '__main__':
-    # Record start time for uptime calculation
-    app_start_time = time.time()
+    # Create directories
+    file_manager.create_directory('projects')
+    file_manager.create_directory('static')
+    file_manager.create_directory('templates')
     
-    # Initialize services
-    if not initialize_services():
-        logger.error("Failed to initialize services. Exiting.")
-        sys.exit(1)
+    logger.info("=" * 50)
+    logger.info("🚀 BotManager V3.0 - DEEPSEEK ONLY")
+    logger.info(f"DeepSeek API: {'✅' if os.getenv('DEEPSEEK_API_KEY') else '❌'}")
+    logger.info(f"GitHub: {'✅' if os.getenv('GITHUB_TOKEN') else '❌'}")
+    logger.info("=" * 50)
     
-    # Start background tasks
-    start_background_tasks()
-    
-    # Get port from environment or use default
     port = int(os.environ.get('PORT', 5000))
+    debug = os.environ.get('DEBUG', 'False').lower() == 'true'
     
-    # Run Flask app
-    logger.info(f"🚀 Starting BotManager V{DEFAULT_CONFIG['version']} on port {port}")
-    logger.info(f"📊 Max bots supported: {DEFAULT_CONFIG['max_bots']}")
-    logger.info(f"💾 Project storage: {DEFAULT_CONFIG['project_storage']}")
-    
-    app.run(host='0.0.0.0', port=port, debug=False)
+    app.run(host='0.0.0.0', port=port, debug=debug)

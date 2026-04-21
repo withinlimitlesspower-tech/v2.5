@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-BotManager V3.0 - DEEPSEEK ONLY
+BotManager V3.0 - DEEPSEEK V3.2 ONLY
+Model: deepseek-chat (V3.2)
 Single Provider, Ultra-Fast, No Fallbacks
+Max Output: 8192 tokens
 Zero Bloat, Maximum Performance
 """
 
@@ -11,6 +13,8 @@ import uuid
 import logging
 import time
 import re
+import zipfile
+import io
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
@@ -21,7 +25,7 @@ from dotenv import load_dotenv
 # Import handlers
 from utils.file_manager import FileManager
 from utils.github_handler import GitHubHandler
-from utils.api_handler import APIHandler
+from utils.api_handler import APIHandler  # DeepSeek V3.2
 
 # Load environment variables
 load_dotenv()
@@ -40,9 +44,9 @@ app = Flask(__name__,
 CORS(app)
 
 # Initialize handlers
-api_handler = APIHandler()  # DeepSeek ONLY
+api_handler = APIHandler()  # DeepSeek V3.2 ONLY
 file_manager = FileManager()
-github_handler = GitHubHandler(os.getenv('GITHUB_TOKEN'))
+github_handler = GitHubHandler(os.getenv('GITHUB_TOKEN')) if os.getenv('GITHUB_TOKEN') else None
 
 
 class ProjectPlanExtractor:
@@ -54,6 +58,12 @@ class ProjectPlanExtractor:
         '.sql', '.sh', '.env', '.gitignore', '.dockerignore'
     }
     
+    INVALID_PATTERNS = [
+        r'logging\.', r'logger\.', r'session\.', r'request\.', r'response\.',
+        r'\.basi', r'\.INFO', r'\.getL', r'\.secr', r'\.envi', r'ron\.get',
+        r'\.get\(', r'\.setd', r'\.modi', r'\.appe', r'\.erro', r'\.warn',
+    ]
+    
     @classmethod
     def extract_files(cls, response: str, user_message: str = "") -> List[str]:
         """Extract file paths from AI response"""
@@ -62,15 +72,42 @@ class ProjectPlanExtractor:
         # Remove code blocks
         response = re.sub(r'```[\s\S]*?```', '', response)
         
-        # Find file paths
+        # Pattern 1: Paths with slashes
         path_pattern = re.compile(r'\b([a-zA-Z][\w\-/]*\.[a-zA-Z]{1,4})\b')
         matches = path_pattern.findall(response)
+        
+        # Pattern 2: List items
+        list_pattern = re.compile(r'[-*•]\s*[`]?([\w\-/]+\.[\w]+)[`]?')
+        matches.extend(list_pattern.findall(response))
+        
+        # Pattern 3: Numbered lists
+        numbered_pattern = re.compile(r'\d+\.\s*[`]?([\w\-/]+\.[\w]+)[`]?')
+        matches.extend(numbered_pattern.findall(response))
         
         seen = set()
         for match in matches:
             match = match.strip().strip('`*[](){}:;\'"')
-            ext = '.' + match.split('.')[-1].lower() if '.' in match else ''
-            if ext in cls.VALID_EXTENSIONS and match not in seen:
+            
+            # Validate
+            if not match or len(match) < 3 or len(match) > 100:
+                continue
+            if '.' not in match:
+                continue
+                
+            ext = '.' + match.split('.')[-1].lower()
+            if ext not in cls.VALID_EXTENSIONS:
+                continue
+                
+            # Check invalid patterns
+            invalid = False
+            for pattern in cls.INVALID_PATTERNS:
+                if re.search(pattern, match, re.IGNORECASE):
+                    invalid = True
+                    break
+            if invalid:
+                continue
+                
+            if match not in seen:
                 seen.add(match)
                 files.append(match)
         
@@ -78,30 +115,49 @@ class ProjectPlanExtractor:
         if not files:
             files = cls._get_default_files(user_message)
         
-        logger.info(f"Extracted {len(files)} files")
-        return files[:35]  # Limit to 35 files
+        # Limit to 35 files
+        if len(files) > 35:
+            priority = ['.py', '.js', '.html', '.css', '.json', '.md']
+            priority_files = [f for f in files if any(f.endswith(ext) for ext in priority)]
+            other_files = [f for f in files if f not in priority_files]
+            files = priority_files + other_files[:35 - len(priority_files)]
+        
+        logger.info(f"📁 Extracted {len(files)} valid files")
+        return files
     
     @classmethod
     def _get_default_files(cls, message: str) -> List[str]:
         """Smart defaults based on project type"""
         msg_lower = message.lower()
         
-        if 'bot' in msg_lower or 'manager' in msg_lower:
+        if 'bot manager' in msg_lower or 'multi-bot' in msg_lower:
             return [
                 'app.py', 'config.py', 'requirements.txt',
                 'api/__init__.py', 'api/bots.py', 'api/chat.py',
-                'utils/api_handler.py', 'utils/file_manager.py',
-                'templates/index.html', 'static/css/style.css',
-                'static/js/app.js', 'README.md'
+                'api/analytics.py', 'services/bot_manager.py',
+                'models/bot_model.py', 'utils/api_handler.py',
+                'utils/file_manager.py', 'templates/index.html',
+                'static/css/style.css', 'static/js/app.js', 'README.md'
             ]
         elif 'flask' in msg_lower:
             return [
                 'app.py', 'requirements.txt',
                 'templates/index.html', 'static/style.css',
-                'README.md'
+                'static/script.js', 'README.md'
+            ]
+        elif 'weather' in msg_lower:
+            return ['index.html', 'style.css', 'script.js', 'README.md']
+        elif 'calculator' in msg_lower:
+            return ['index.html', 'style.css', 'script.js', 'README.md']
+        elif 'todo' in msg_lower:
+            return ['index.html', 'style.css', 'script.js', 'README.md']
+        elif 'react' in msg_lower:
+            return [
+                'src/App.js', 'src/index.js', 'public/index.html',
+                'package.json', 'README.md'
             ]
         else:
-            return ['app.py', 'README.md']
+            return ['app.py', 'requirements.txt', 'README.md']
 
 
 class CodeCleaner:
@@ -123,38 +179,65 @@ class CodeCleaner:
 
 
 def get_smart_tokens(filepath: str) -> int:
-    """Calculate optimal tokens based on file type"""
+    """
+    Calculate optimal tokens based on file type
+    DeepSeek V3.2 max: 8192
+    """
     base_name = filepath.split('/')[-1].lower()
     ext = filepath.split('.')[-1].lower() if '.' in filepath else ''
     
-    # Ultra-small files
+    # 🚀 ULTRA-FAST: Tiny files
     if base_name == '__init__.py':
         return 150
     elif filepath == 'requirements.txt':
         return 250
     elif filepath.endswith('.env') or filepath.endswith('.gitignore'):
         return 200
+    elif base_name == 'package.json':
+        return 400
     elif base_name == 'README.md':
         return 800
     
-    # Config files
+    # ⚡ FAST: Config files
     elif ext in ['txt', 'md', 'json', 'yaml', 'yml', 'toml']:
-        return 500
+        if 'config' in base_name or 'settings' in base_name:
+            return 500
+        else:
+            return 400
     
-    # Frontend files
+    # 🎨 MEDIUM: Frontend files
     elif ext in ['css', 'scss', 'html']:
-        return 1500
+        if 'dark' in base_name or 'theme' in base_name:
+            return 800
+        else:
+            return 1500
     
-    # Code files
-    elif ext in ['py', 'js', 'ts']:
-        if 'app.py' in base_name or 'main.py' in base_name:
+    # 💻 COMPLEX: Code files
+    elif ext in ['py', 'js', 'ts', 'jsx', 'tsx']:
+        if base_name in ['app.py', 'main.py', 'server.py', 'index.js']:
             return 4096
-        elif 'api' in filepath or 'handler' in filepath:
+        elif 'api' in filepath or 'routes' in filepath:
             return 3000
+        elif 'service' in filepath or 'manager' in filepath or 'handler' in filepath:
+            return 3500
+        elif 'model' in filepath or 'schema' in filepath:
+            return 2000
+        elif 'util' in filepath or 'helper' in filepath:
+            return 2000
         else:
             return 2500
     
+    # Default
     return 1000
+
+
+def extract_project_name(message: str, max_length: int = 30) -> str:
+    """Extract project name from message"""
+    words = message.strip().split()[:5]
+    name = ' '.join(words).title()
+    if len(name) > max_length:
+        name = name[:max_length-3] + '...'
+    return name
 
 
 # ============================================================
@@ -176,14 +259,17 @@ def health_check():
         'version': '3.0.0',
         'provider': 'deepseek',
         'model': 'deepseek-chat',
+        'model_version': '3.2',
+        'max_output_tokens': 8192,
         'fallbacks': 'NONE',
+        'github_connected': github_handler is not None,
         'stats': api_handler.get_stats()
     })
 
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
-    """Chat with DeepSeek - Get project plan"""
+    """Chat with DeepSeek V3.2 - Get project plan"""
     try:
         data = request.get_json()
         if not data:
@@ -195,26 +281,30 @@ def chat():
         if not user_message:
             return jsonify({'error': 'Message cannot be empty'}), 400
 
-        logger.info(f"Processing chat for project {project_id}")
+        logger.info(f"💬 Processing chat for project {project_id}")
 
         # System prompt for project planning
-        system_prompt = """You are an AI project planning assistant. When users describe a project:
+        system_prompt = """You are an AI project planning assistant powered by DeepSeek V3.2. 
+        When users describe a project:
+        
         1. Provide a structured plan with file structure
         2. List specific files with full paths (e.g., backend/api/bots.py)
         3. Recommend technical stack
         4. Include key implementation details
-
-        Be specific about which files need to be created."""
+        5. Suggest appropriate architecture
+        
+        Be specific about which files need to be created. Use proper file extensions."""
 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message}
         ]
 
-        # Get response from DeepSeek
-        response = api_handler.chat(messages)
+        # Get response from DeepSeek V3.2
+        response = api_handler.chat(messages, max_tokens=2000)
         
         if not response['success']:
+            logger.error(f"Chat failed: {response['error']}")
             return jsonify({'error': response['error']}), 500
 
         ai_response = response['content']
@@ -222,26 +312,35 @@ def chat():
 
         project_plan = {
             'files': files,
-            'description': user_message[:200]
+            'description': ai_response[:500]
         }
+
+        project_name = extract_project_name(user_message)
 
         # Save project
         project_data = {
             'id': project_id,
+            'name': project_name,
             'plan': project_plan,
             'description': user_message,
             'created_at': datetime.now().isoformat(),
-            'status': 'planned'
+            'updated_at': datetime.now().isoformat(),
+            'status': 'planned',
+            'model': 'deepseek-chat'
         }
+        
+        file_manager.create_directory('projects')
         file_manager.write_json(f"projects/{project_id}.json", project_data)
 
-        logger.info(f"Files to generate: {files}")
+        logger.info(f"📋 Files to generate: {files}")
         
         return jsonify({
             'response': ai_response,
             'project_id': project_id,
+            'project_name': project_name,
             'project_plan': project_plan,
-            'tokens_used': response.get('tokens', 0)
+            'tokens_used': response.get('tokens', 0),
+            'model': 'deepseek-chat'
         })
 
     except Exception as e:
@@ -251,7 +350,7 @@ def chat():
 
 @app.route('/api/generate', methods=['POST'])
 def generate_code():
-    """Generate code for all files in project"""
+    """Generate code for all files using DeepSeek V3.2"""
     try:
         data = request.get_json()
         if not data:
@@ -269,20 +368,32 @@ def generate_code():
 
         logger.info(f"🚀 Generating {len(files)} files for project {project_id}")
 
+        # Load project data
+        project_file = f"projects/{project_id}.json"
+        if not file_manager.file_exists(project_file):
+            return jsonify({'error': f'Project {project_id} not found'}), 404
+        
+        project_data = file_manager.read_json(project_file)
+        description = project_data.get('description', 'AI Generated Project')
+
         generated_files = {}
         failed_files = []
+        total_tokens = 0
 
-        for filepath in files:
+        for idx, filepath in enumerate(files, 1):
             try:
                 smart_tokens = get_smart_tokens(filepath)
-                logger.info(f"⚡ Generating {filepath} (tokens={smart_tokens})")
+                logger.info(f"⚡ [{idx}/{len(files)}] Generating {filepath} (tokens={smart_tokens})")
 
                 system_prompt = f"""You are an expert programmer. Generate complete, production-ready code for {filepath}.
+                
+                Project: {description}
                 
                 Important:
                 - Provide ONLY the code without markdown formatting
                 - Include all necessary imports and dependencies
                 - Add helpful comments
+                - Follow best practices
                 - Ensure the code is functional"""
 
                 messages = [
@@ -290,27 +401,32 @@ def generate_code():
                     {"role": "user", "content": f"Generate the complete code for {filepath}"}
                 ]
 
-                response = api_handler.chat(messages, max_tokens=smart_tokens)
+                response = api_handler.chat(messages, temperature=0.3, max_tokens=smart_tokens)
                 
                 if response['success']:
                     code = CodeCleaner.clean(response['content'])
                     generated_files[filepath] = code
-                    file_manager.write_file(f"projects/{project_id}/files/{filepath}", code)
-                    logger.info(f"✅ Generated {filepath}")
+                    
+                    # Save file
+                    file_path = f"projects/{project_id}/files/{filepath}"
+                    file_manager.write_file(file_path, code)
+                    
+                    total_tokens += response.get('tokens', 0)
+                    logger.info(f"   ✅ Generated {filepath} ({response.get('tokens', 0)} tokens)")
                 else:
                     failed_files.append(filepath)
-                    logger.error(f"❌ Failed {filepath}: {response['error']}")
+                    logger.error(f"   ❌ Failed {filepath}: {response['error']}")
 
             except Exception as e:
-                logger.error(f"Failed {filepath}: {str(e)}")
+                logger.error(f"   ❌ Exception {filepath}: {str(e)}")
                 failed_files.append(filepath)
 
         if not generated_files:
             raise Exception("No files were successfully generated")
 
-        # Push to GitHub if token available
+        # Push to GitHub if configured
         repo_url = None
-        if os.getenv('GITHUB_TOKEN'):
+        if github_handler:
             try:
                 repo_name = f"ai-project-{project_id[:8]}"
                 repo_url = github_handler.create_and_push(repo_name, generated_files)
@@ -319,19 +435,21 @@ def generate_code():
                 logger.warning(f"GitHub push failed: {e}")
 
         # Update project status
-        project_file = f"projects/{project_id}.json"
-        if file_manager.file_exists(project_file):
-            project_data = file_manager.read_json(project_file)
-            project_data['status'] = 'generated'
-            project_data['repo_url'] = repo_url
-            project_data['generated_at'] = datetime.now().isoformat()
-            file_manager.write_json(project_file, project_data)
+        project_data['status'] = 'generated'
+        project_data['repo_url'] = repo_url
+        project_data['generated_at'] = datetime.now().isoformat()
+        project_data['updated_at'] = datetime.now().isoformat()
+        project_data['total_tokens_used'] = total_tokens
+        project_data['files_generated'] = len(generated_files)
+        project_data['files_failed'] = len(failed_files)
+        file_manager.write_json(project_file, project_data)
 
         return jsonify({
             'success': True,
             'repo_url': repo_url,
             'generated_files': list(generated_files.keys()),
             'failed_files': failed_files if failed_files else None,
+            'total_tokens': total_tokens,
             'stats': api_handler.get_stats()
         })
 
@@ -347,16 +465,24 @@ def get_projects():
         projects = []
         if file_manager.directory_exists('projects'):
             for file in file_manager.list_files('projects', '*.json'):
-                project = file_manager.read_json(file)
-                projects.append({
-                    'id': project.get('id'),
-                    'description': project.get('description', '')[:100],
-                    'status': project.get('status', 'unknown'),
-                    'created_at': project.get('created_at'),
-                    'repo_url': project.get('repo_url')
-                })
+                try:
+                    project = file_manager.read_json(file)
+                    projects.append({
+                        'id': project.get('id'),
+                        'name': project.get('name', 'Untitled'),
+                        'description': project.get('description', '')[:100],
+                        'status': project.get('status', 'unknown'),
+                        'created_at': project.get('created_at'),
+                        'generated_at': project.get('generated_at'),
+                        'repo_url': project.get('repo_url'),
+                        'files_generated': project.get('files_generated', 0),
+                        'model': project.get('model', 'deepseek-chat')
+                    })
+                except Exception as e:
+                    logger.error(f"Error loading {file}: {e}")
         
         projects.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        logger.info(f"📚 Found {len(projects)} projects")
         return jsonify({'projects': projects})
         
     except Exception as e:
@@ -390,11 +516,16 @@ def get_project_files(project_id: str):
         
         files = []
         for filepath in file_manager.list_files(files_dir, '*', recursive=True):
-            content = file_manager.read_file(filepath)
-            files.append({
-                'path': filepath.replace(f"projects/{project_id}/files/", ""),
-                'content': content
-            })
+            try:
+                content = file_manager.read_file(filepath)
+                rel_path = filepath.replace(files_dir + '/', '')
+                files.append({
+                    'path': rel_path,
+                    'content': content,
+                    'size': len(content)
+                })
+            except Exception as e:
+                logger.error(f"Error reading {filepath}: {e}")
         
         return jsonify({'files': files})
         
@@ -407,9 +538,6 @@ def get_project_files(project_id: str):
 def download_project(project_id: str):
     """Download project as ZIP"""
     try:
-        import zipfile
-        import io
-        
         files_dir = f"projects/{project_id}/files"
         if not file_manager.directory_exists(files_dir):
             return jsonify({'error': 'Project files not found'}), 404
@@ -417,15 +545,19 @@ def download_project(project_id: str):
         memory_file = io.BytesIO()
         with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
             for filepath in file_manager.list_files(files_dir, '*', recursive=True):
-                arcname = filepath.replace(f"projects/{project_id}/files/", "")
+                arcname = filepath.replace(files_dir + '/', '')
                 zf.write(filepath, arcname)
         
         memory_file.seek(0)
+        
+        project_data = file_manager.read_json(f"projects/{project_id}.json")
+        project_name = project_data.get('name', project_id)[:20]
+        
         return send_file(
             memory_file,
             mimetype='application/zip',
             as_attachment=True,
-            download_name=f'project_{project_id}.zip'
+            download_name=f'{project_name}_{project_id[:8]}.zip'
         )
         
     except Exception as e:
@@ -446,7 +578,7 @@ def delete_project(project_id: str):
         if file_manager.directory_exists(files_dir):
             file_manager.delete_directory(files_dir, force=True)
         
-        logger.info(f"Deleted project {project_id}")
+        logger.info(f"🗑️ Deleted project {project_id}")
         return jsonify({'success': True, 'message': 'Project deleted'})
         
     except Exception as e:
@@ -454,30 +586,119 @@ def delete_project(project_id: str):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/project/<project_id>/status', methods=['GET'])
+def get_project_status(project_id: str):
+    """Get project generation status"""
+    try:
+        project_file = f"projects/{project_id}.json"
+        if not file_manager.file_exists(project_file):
+            return jsonify({'status': 'not_found'})
+        
+        project = file_manager.read_json(project_file)
+        return jsonify({
+            'status': project.get('status', 'unknown'),
+            'repo_url': project.get('repo_url'),
+            'files_generated': project.get('files_generated', 0),
+            'updated_at': project.get('updated_at')
+        })
+        
+    except Exception as e:
+        logger.error(f"Status error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     """Get system statistics"""
+    api_stats = api_handler.get_stats()
+    
+    # Count projects
+    project_count = 0
+    if file_manager.directory_exists('projects'):
+        project_count = len(file_manager.list_files('projects', '*.json'))
+    
     return jsonify({
-        'api': api_handler.get_stats(),
+        'api': api_stats,
+        'projects_total': project_count,
         'provider': 'deepseek',
         'model': 'deepseek-chat',
-        'fallbacks': 'NONE'
+        'version': '3.2',
+        'max_tokens': 8192,
+        'fallbacks': 'NONE',
+        'github_connected': github_handler is not None
     })
 
 
+@app.route('/api/test-connection', methods=['GET'])
+def test_connection():
+    """Test DeepSeek V3.2 connection"""
+    try:
+        is_healthy = api_handler.health_check()
+        return jsonify({
+            'connected': is_healthy,
+            'provider': 'deepseek',
+            'model': 'deepseek-chat',
+            'version': '3.2'
+        })
+    except Exception as e:
+        return jsonify({
+            'connected': False,
+            'error': str(e)
+        }), 500
+
+
+# ============================================================
+# ERROR HANDLERS
+# ============================================================
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
 if __name__ == '__main__':
-    # Create directories
+    # Create necessary directories
     file_manager.create_directory('projects')
     file_manager.create_directory('static')
     file_manager.create_directory('templates')
     
-    logger.info("=" * 50)
-    logger.info("🚀 BotManager V3.0 - DEEPSEEK ONLY")
-    logger.info(f"DeepSeek API: {'✅' if os.getenv('DEEPSEEK_API_KEY') else '❌'}")
-    logger.info(f"GitHub: {'✅' if os.getenv('GITHUB_TOKEN') else '❌'}")
-    logger.info("=" * 50)
+    # Create default index.html if not exists
+    if not file_manager.file_exists('templates/index.html'):
+        default_html = """<!DOCTYPE html>
+<html>
+<head>
+    <title>BotManager V3 - DeepSeek V3.2</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+    <h1>🤖 BotManager V3.0</h1>
+    <p>DeepSeek V3.2 - Ready</p>
+    <p>Model: deepseek-chat | Max Tokens: 8192</p>
+</body>
+</html>"""
+        file_manager.write_file('templates/index.html', default_html)
+    
+    logger.info("=" * 60)
+    logger.info("🚀 BotManager V3.0 Starting...")
+    logger.info(f"🤖 Provider: DeepSeek V3.2 (deepseek-chat)")
+    logger.info(f"📊 Max Output Tokens: 8192")
+    logger.info(f"🔑 DeepSeek API: {'✅ Configured' if os.getenv('DEEPSEEK_API_KEY') else '❌ MISSING'}")
+    logger.info(f"📦 GitHub: {'✅ Connected' if github_handler else '❌ Not configured'}")
+    logger.info(f"🔄 Fallbacks: NONE (DeepSeek ONLY)")
+    logger.info(f"⚡ Smart Tokens: ENABLED")
+    logger.info("=" * 60)
     
     port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('DEBUG', 'False').lower() == 'true'
+    debug = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
     
     app.run(host='0.0.0.0', port=port, debug=debug)
